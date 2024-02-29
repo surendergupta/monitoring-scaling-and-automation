@@ -1,6 +1,7 @@
 import boto3
 import gzip
 import re
+import json
 import openpyxl
 from botocore.exceptions import NoCredentialsError
 
@@ -8,6 +9,7 @@ aws_region = 'us-east-1'
 s3_client = boto3.client('s3')
 sns_client = boto3.client('sns', region_name=aws_region)
 elbv2_client = boto3.client('elbv2', region_name=aws_region)
+iam_client = boto3.client('iam', region_name=aws_region)
 
 def get_alb_arn_from_xlsx_file():
     filename= 'elb_info.xlsx'
