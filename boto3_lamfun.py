@@ -103,13 +103,7 @@ def lambda_handler(event, context):
                 # Terminate instance
                 terminate_instance(target_id)
                 
-                # Terminate the problematic instance
-                # terminate_instance_response = asg_client.terminate_instance_in_auto_scaling_group(
-                #     InstanceId=target_id,
-                #     ShouldDecrementDesiredCapacity=False
-                # )                
-                # print(f'Instance {target_id} terminated successfully. Response of terminate instance in auto scaling group {terminate_instance_response}')
-
+                # Terminate the problematic instance                
                 # Send notification
                 send_notification(target_id, snapshot_id)                
                 

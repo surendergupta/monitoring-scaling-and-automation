@@ -5,7 +5,7 @@ import openpyxl
 from botocore.exceptions import NoCredentialsError
 
 aws_region = 'us-east-1'
-s3_client = boto3.client('s3', region_name=aws_region)
+s3_client = boto3.client('s3')
 sns_client = boto3.client('sns', region_name=aws_region)
 elbv2_client = boto3.client('elbv2', region_name=aws_region)
 
@@ -13,36 +13,73 @@ def get_alb_arn_from_xlsx_file():
     filename= 'elb_info.xlsx'
     dataframe = openpyxl.load_workbook(filename)
     dataframe1 = dataframe.active    
-    value = dataframe1.cell(row=4, column=1).value
+    value = dataframe1.cell(row=2, column=1).value
     return value
 
 alb_arn = get_alb_arn_from_xlsx_file()
 topic_name = 'AdminNotifications'
-s3_bucket_name = 'suri-s3-boto-scalling'
+s3_bucket_name = 'suri-lambda-bucket'
 
-def create_bucket_if_not_exist():
-    response = s3_client.list_buckets()
+def create_s3_bucket():
+    try:
+        s3_client.create_bucket(Bucket=s3_bucket_name, CreateBucketConfiguration={'LocationConstraint': aws_region})
+        print(f'S3 bucket "{s3_bucket_name}" created successfully.')
+    except NoCredentialsError:
+        print('Credentials not available.')
 
-    for bucket in response['Buckets']:
-        if bucket['Name'] == s3_bucket_name:
-            return s3_bucket_name
-        
-    s3_client.create_bucket(
-        Bucket=s3_bucket_name,
-        CreateBucketConfiguration={
-            'LocationConstraint': 'us-east-1'
-        }
-    )
 
-    print("S3 bucket created successfully:", s3_bucket_name)
+def attach_s3_policy_to_role(role_name):
+    policy_document = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": "elasticloadbalancing:ModifyLoadBalancerAttributes",
+                "Resource": "arn:aws:elasticloadbalancing:us-east-1:060095847722:loadbalancer/app/suri-tm-lb/a0b625daa05bd7e2"            
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetBucketLogging",
+                    "s3:PutBucketLogging",
+                    "s3:GetBucketAcl",
+                    "s3:PutBucketAcl",
+                    "s3:CreateBucket",
+                    "s3:ListBucket",
+                    "s3:PutObject"
+                ],
+                "Resource": [
+                    f"arn:aws:s3:::{s3_bucket_name}",
+                    f"arn:aws:s3:::{s3_bucket_name}/*"
+                ]
+            },
+            {
+                "Effect": "Allow",
+                "Action": [
+                    "s3:GetObject",
+                    "s3:PutObject"
+                ],
+                "Resource": [
+                    f"arn:aws:s3:::{s3_bucket_name}/*"
+                ]
+            }
+        ]
+    }
+
+    try:
+        response = iam_client.put_role_policy(
+            RoleName=role_name,
+            PolicyName='S3AccessPolicy',
+            PolicyDocument=json.dumps(policy_document)
+        )
+        print(response)
+        print("IAM policy attached successfully.")
+    except NoCredentialsError:
+        print("Credentials not available.")
 
 def configure_alb_logging():
     try:
-        result = create_bucket_if_not_exist()
-        if result:
-            print("Bucket prefix:", result)
-        else:
-            print("Bucket created successfully.")
+        attach_s3_policy_to_role('roleS3Access')
 
         elbv2_client.modify_load_balancer_attributes(
             LoadBalancerArn=alb_arn,
@@ -57,11 +94,11 @@ def configure_alb_logging():
                 },
                 {
                     'Key': 'access_logs.s3.prefix',
-                    'Value': 'alb-access-logs',
+                    'Value': 'logs',
                 },
             ],
         )
-        print(f'ALB access logs configured successfully. Log files will be stored in S3 bucket: {s3_bucket_name}')
+        print(f'ALB access logs are configured to be stored in the specified S3 bucket. Log files will be stored in S3 bucket: {s3_bucket_name}')
 
     except NoCredentialsError:
         print('Credentials not available.')
@@ -82,14 +119,6 @@ def getTopicArn():
     else:
         print("Topic not found.")
         return topic_arn
-
-def is_suspicious(log_line):
-    ip_address = re.search(r'(\d+\.\d+\.\d+\.\d+)', log_line).group(1)
-    count = log_line.count(ip_address)
-    if count > 1000:
-        return True
-    else:
-        return False
 
 def send_notification(subject, message):
     # GET SNS topic ARN
@@ -117,7 +146,22 @@ def lambda_handler(event, context):
             log_lines = log_data.decode('utf-8').split('\n')
             for log_line in log_lines:
                 # Analyze log line for suspicious activities or high traffic
-                if is_suspicious(log_line):
+                if is_health_issue(log_data):
+                    subject = 'Web Application Health Issue detected Alert'
+                    message = f"Health issue detected in log file: {object_key}"
+                    send_notification(subject, message)
+                    
+                elif is_scaling_event(log_data):
+                    subject = 'Web Application Scaling detected Alert'
+                    message = f"Scaling event detected in log file: {object_key}"
+                    send_notification(subject, message)
+                    
+                elif is_high_traffic(log_data):
+                    subject = 'Web Application High Traffic detected Alert'
+                    message = f'High traffic detected in ALB access log: {object_key}'
+                    send_notification(subject, message)
+                    
+                elif is_suspicious(log_line):
                     # Send notification via SNS
                     subject = 'Web Application DDoS attack detected Alert'
                     message = 'Web application Potential DDoS attack detected.'
@@ -130,7 +174,57 @@ def lambda_handler(event, context):
                 message = f'High traffic detected in ALB access log: {object_key}'
                 send_notification(subject, message)                
 
+def is_health_issue(log_data):
+    if "500 Internal Server Error" in log_data:
+        return True
+    
+    if "CRITICAL" in log_data:
+        return True
+    return False
+
+def is_scaling_event(log_data):
+    if "Scaling event" in log_data:
+        return True
+    
+    if "Increased traffic" in log_data:
+        return True
+    
+    return False
+
+def is_high_traffic(log_data):
+    log_lines = log_data.split('\n')
+    request_count = sum(1 for line in log_lines if 'GET' in line or 'POST' in line)
+    traffic_threshold = 1000
+    
+    if request_count > traffic_threshold:
+        return True
+    
+    ip_request_count = {}
+    for line in log_lines:
+        if 'GET' in line or 'POST' in line:
+            ip = line.split()[0]  # Assuming IP address is the first part of the log entry
+            ip_request_count[ip] = ip_request_count.get(ip, 0) + 1
+    high_traffic_threshold = 100
+
+    for ip, count in ip_request_count.items():
+        if count > high_traffic_threshold:
+            return True
+        
+    return False
+
+def is_suspicious(log_line):
+    ip_address = re.search(r'(\d+\.\d+\.\d+\.\d+)', log_line).group(1)
+    count = log_line.count(ip_address)
+    if count > 1000:
+        return True
+    else:
+        return False
+    
 if __name__ == '__main__':
+
+    # create bucket S3
+    create_s3_bucket()
+
     # Configure ALB logging
     configure_alb_logging()
 
